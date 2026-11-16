@@ -16,6 +16,9 @@ from .constants import LIBRARIES_BASE_URL
 from .rules import rules_allow
 
 
+MAVEN_CENTRAL_URL = "https://repo.maven.apache.org/maven2/"
+
+
 def maven_to_path(name: str) -> str:
     parts = name.split(":")
     group, artifact, version = parts[0], parts[1], parts[2]
@@ -52,7 +55,7 @@ def fix_maven_url(url: str) -> str:
     return url
 
 
-def collect_library_entries(libraries: list, features=None):
+def collect_library_entries(libraries: list, features=None, keep_versions=False):
     classpath_entries = []
     native_entries = []
     features = features or {}
@@ -70,7 +73,7 @@ def collect_library_entries(libraries: list, features=None):
         artifact = downloads.get("artifact")
 
         if artifact and artifact.get("path"):
-            key = lib_key(name) if name else artifact["path"]
+            key = artifact["path"] if keep_versions else (lib_key(name) if name else artifact["path"])
             if key not in seen_keys:
                 seen_keys.add(key)
                 classpath_entries.append({
@@ -80,10 +83,10 @@ def collect_library_entries(libraries: list, features=None):
                     "sha1": artifact.get("sha1"),
                 })
         elif name and not downloads.get("classifiers"):
-            key = lib_key(name)
+            path = maven_to_path(name)
+            key = path if keep_versions else lib_key(name)
             if key not in seen_keys:
                 seen_keys.add(key)
-                path = maven_to_path(name)
                 base_url = fix_maven_url(lib.get("url") or LIBRARIES_BASE_URL)
                 classpath_entries.append({
                     "path": path,
@@ -115,6 +118,14 @@ def collect_library_entries(libraries: list, features=None):
     return classpath_entries, native_entries
 
 
+def download_urls(entry: dict) -> list[str]:
+    urls = [entry.get("url")]
+    path = entry["path"]
+    if path.startswith("net/sf/jopt-simple/jopt-simple/"):
+        urls.append(MAVEN_CENTRAL_URL + path)
+    return list(dict.fromkeys(url for url in urls if url))
+
+
 def entry_weight(entry: dict) -> int:
     return int(entry.get("size") or 300_000)
 
@@ -124,7 +135,8 @@ def ensure_file(entry: dict, dest_root: Path, tracker, retries: int = 3):
     quick_sha = None if entry.get("quick") else entry.get("sha1")
     if file_is_valid(dest, entry.get("size"), quick_sha):
         return dest
-    if not entry.get("url"):
+    urls = download_urls(entry)
+    if not urls:
         raise RuntimeError(f"Failed to download library: {entry['path']} (no URL)")
 
     def cb(n):
@@ -132,13 +144,15 @@ def ensure_file(entry: dict, dest_root: Path, tracker, retries: int = 3):
             tracker.add(n)
 
     last = None
-    for attempt in range(retries):
-        try:
-            http_download(entry["url"], dest, entry.get("size"), entry.get("sha1"), cb)
-            return dest
-        except Exception as exc:
-            last = exc
-            time.sleep(1.0 * (attempt + 1))
+    for url in urls:
+        for attempt in range(retries):
+            try:
+                http_download(url, dest, entry.get("size"), entry.get("sha1"), cb)
+                return dest
+            except Exception as exc:
+                last = exc
+                if attempt + 1 < retries:
+                    time.sleep(1.0 * (attempt + 1))
     raise RuntimeError(f"Failed to download {entry['path']} ({last})") from last
 
 
@@ -154,7 +168,7 @@ def download_all(items, tracker, workers: int = 10):
         if file_is_valid(dest, entry.get("size"), quick_sha):
             tracker.add(entry_weight(entry))
             continue
-        if not entry.get("url"):
+        if not download_urls(entry):
             missing.append(entry)
             continue
         todo.append((entry, root))
